@@ -3,237 +3,365 @@ import sys
 import argparse
 import subprocess
 import time
+import json
+import shutil
 from pathlib import Path
-from openai import OpenAI, APIError, RateLimitError, Timeout
 from datetime import datetime
+from typing import List, Dict, Any, Optional
 
-def clone_github_repo(repo_url, target_path):
-    """克隆GitHub仓库到指定路径"""
-    if os.path.exists(target_path):
-        if os.listdir(target_path):
-            print(f"错误: 目标路径 '{target_path}' 非空，请指定空目录或新目录")
-            sys.exit(1)
-    else:
-        os.makedirs(target_path, exist_ok=True)
-    
-    try:
-        print(f"正在克隆仓库: {repo_url} 到 {target_path}")
-        subprocess.run(
-            ["git", "clone", "--depth=1", repo_url, target_path],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        print("仓库克隆成功")
-    except subprocess.CalledProcessError:
-        print("错误: Git克隆失败，请检查仓库URL和网络连接")
-        sys.exit(1)
-    except FileNotFoundError:
-        print("错误: 未找到Git命令，请先安装Git")
-        sys.exit(1)
+# --- 修改 1: 简化导入，移除引起冲突的 Timeout ---
+try:
+    # 只导入核心类和基础异常
+    from openai import OpenAI, APIError
+except ImportError:
+    print("错误: 缺少必要的库 'openai'。请运行: pip install openai")
+    sys.exit(1)
 
-def find_python_files(root_dir):
-    """递归查找目录中所有.py文件"""
-    python_files = []
-    for root, _, files in os.walk(root_dir):
-        for file in files:
-            if file.endswith(".py") and not file.startswith("__"):  # 排除__init__.py等
-                python_files.append(Path(os.path.join(root, file)))
-    return python_files
+# ==========================================
+# 0. 基础服务 (LLM Service)
+# ==========================================
+class LLMService:
+    def __init__(self, api_key: str, base_url: str, model: str = "mimo-v2-flash"):
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.model = model
 
-def convert_to_go(client, python_code, retries=3):
-    """调用API将Python代码转换为Go代码"""
-    # 获取当前日期（根据系统提示）
-    current_date = datetime.now().strftime("%A, %B %d, %Y")
-    
-    system_prompt = (
-        f"You are MiMo, an AI assistant developed by Xiaomi. Today is date: {current_date}. "
-        "Your knowledge cutoff date is December 2024. You are an expert in programming languages conversion. "
-        "Your task is to convert Python code to Go code with high accuracy and idiomatic Go style."
-    )
-    
-    user_prompt = (
-        "Convert the following Python code to idiomatic Go code:\n\n"
-        "Requirements:\n"
-        "1. Preserve the original logic exactly\n"
-        "2. Use Go best practices and standard library where appropriate\n"
-        "3. Add necessary type declarations and handle Python dynamic features appropriately\n"
-        "4. Output ONLY the Go code with no additional text, markdown formatting, or explanations\n\n"
-        "Python code:\n```python\n" + python_code + "\n```"
-    )
-    
-    for attempt in range(retries):
-        try:
-            completion = client.chat.completions.create(
-                model="mimo-v2-flash",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                max_completion_tokens=4096,
-                temperature=0.2,
-                top_p=0.95,
-                stream=False,
-                stop=None,
-                frequency_penalty=0,
-                presence_penalty=0,
-                extra_body={
-                    "thinking": {"type": "disabled"}
-                }
-            )
-            
-            go_code = completion.choices[0].message.content.strip()
-            
-            # 清理可能的Markdown代码块标记
-            if go_code.startswith("```go"):
-                go_code = go_code[5:].lstrip()
-            if go_code.startswith("```"):
-                go_code = go_code[3:].lstrip()
-            if go_code.endswith("```"):
-                go_code = go_code[:-3].rstrip()
-                
-            return go_code.strip()
-            
-        except (RateLimitError, Timeout) as e:
-            wait_time = 2 ** attempt
-            print(f"API限制/超时 (尝试 {attempt+1}/{retries}): {str(e)}，{wait_time}秒后重试...")
-            time.sleep(wait_time)
-        except APIError as e:
-            print(f"API错误 (尝试 {attempt+1}/{retries}): {str(e)}")
-            if attempt == retries - 1:
-                raise
-            time.sleep(1)
-    
-    raise Exception("API转换失败，已达到最大重试次数")
-
-def main():
-    parser = argparse.ArgumentParser(description='GitHub Python转Go转换工具')
-    parser.add_argument('github_url', help='GitHub仓库URL (e.g., https://github.com/user/repo.git)')
-    parser.add_argument('target_path', help='本地存储路径 (必须为空目录)')
-    parser.add_argument('api_key', help='API Key, 用于访问MiMo API')
-    args = parser.parse_args()
-
-    # 验证API密钥
-    api_key = args.api_key
-    if not api_key:
-        print("错误: 未设置MIMO_API_KEY环境变量")
-        print("请通过以下方式设置: export MIMO_API_KEY='your_api_key'")
-        sys.exit(1)
-
-    # 严格遵循官方例程初始化客户端（注意base_url末尾空格）
-    try:
-        client = OpenAI(
-            api_key=api_key,
-            base_url="https://api.xiaomimimo.com/v1"  # 保留官方例程中的空格
-        )
-        # 测试API连接
-        completion = client.chat.completions.create(
-            model="mimo-v2-flash",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are MiMo, an AI assistant developed by Xiaomi. Today is date: Tuesday, December 16, 2025. Your knowledge cutoff date is December 2024."
-                },
-                {
-                    "role": "user",
-                    "content": "please introduce yourself"
-                }
-            ],
-            max_completion_tokens=1024,
-            temperature=0.8,
-            top_p=0.95,
-            stream=False,
-            stop=None,
-            frequency_penalty=0,
-            presence_penalty=0,
-            extra_body={
-                "thinking": {"type": "disabled"}
-            }
-        )
-        print(completion.model_dump_json())
-    except Exception as e:
-        print(f"API初始化失败: {str(e)}")
-        print("\n可能的原因及解决方案:")
-        print("1. API密钥无效 - 检查MIMO_API_KEY是否正确设置")
-        print("2. base_url配置问题 - 官方例程中URL末尾有空格，如果失败可尝试移除空格")
-        print("3. 网络连接问题 - 确保能访问api.xiaomimimo.com")
-        print("4. 模型名称变更 - 确认'mimo-v2-flash'是当前有效模型")
-        sys.exit(1)
-
-    # 克隆仓库
-    clone_github_repo(args.github_url, args.target_path)
-    
-    # 查找Python文件
-    py_files = find_python_files(args.target_path)
-    if not py_files:
-        print("未找到任何Python文件，程序退出")
-        sys.exit(0)
-    
-    print(f"找到 {len(py_files)} 个Python文件，开始转换...")
-    
-    # 创建转换后代码的保存目录
-    converted_dir = Path(args.target_path) / "go_converted"
-    converted_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 处理每个Python文件
-    success_count = 0
-    failure_details = []
-    
-    for i, py_file in enumerate(py_files, 1):
-        relative_path = py_file.relative_to(args.target_path)
-        print(f"\n[{i}/{len(py_files)}] 处理文件: {relative_path}")
+    def call_ai(self, system_prompt: str, user_prompt: str, temperature: float = 0.2, json_mode: bool = False) -> str:
+        """通用的 AI 调用方法"""
+        retries = 3
+        extra_body = {"thinking": {"type": "disabled"}}
         
-        try:
-            # 读取Python代码
-            with open(py_file, 'r', encoding='utf-8') as f:
-                python_code = f.read()
+        if json_mode:
+            system_prompt += "\nIMPORTANT: Output strictly in valid JSON format. No markdown."
+
+        for attempt in range(retries):
+            try:
+                completion = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=temperature,
+                    max_completion_tokens=4096,
+                    extra_body=extra_body
+                )
+                content = completion.choices[0].message.content.strip()
+                return self._clean_markdown(content)
             
-            if not python_code.strip():
-                print(f"  ⚠️ 跳过空文件")
+            # --- 修改 2: 移除具体的 Timeout/RateLimitError 捕获 ---
+            # 直接捕获 APIError (OpenAI所有错误的基类)
+            except APIError as e:
+                wait = 2 ** attempt
+                print(f"    [LLM警告] API返回错误 (尝试 {attempt+1}/{retries}): {e}")
+                print(f"    -> 等待 {wait} 秒后重试...")
+                time.sleep(wait)
+                
+            except Exception as e:
+                # 捕获其他网络或系统错误
+                print(f"    [LLM错误] 未知异常: {str(e)}")
+                if attempt == retries - 1: raise
+                time.sleep(1)
+                
+        return ""
+
+    def _clean_markdown(self, text: str) -> str:
+        if text.startswith("```"):
+            lines = text.split('\n')
+            if len(lines) > 1:
+                return '\n'.join(lines[1:-1]).strip()
+        return text.strip()
+
+# ==========================================
+# 4. 记忆层 (MemoryLayer)
+# ==========================================
+class MemoryLayer:
+    def __init__(self):
+        self.records: List[Dict] = []
+        self.project_context: Dict = {} 
+
+    def save_context(self, file_path: str, analysis: Dict, strategy: Dict):
+        self.records.append({
+            "file": file_path,
+            "analysis": analysis,
+            "strategy": strategy,
+            "timestamp": datetime.now().isoformat()
+        })
+
+    def get_summary(self):
+        return {
+            "processed_files": len(self.records),
+            "details": self.records
+        }
+
+
+# ==========================================
+# 1. 感知层 (PerceptionLayer)
+# ==========================================
+class PerceptionLayer:
+    def __init__(self, llm: LLMService, target_path: Path):
+        self.llm = llm
+        self.target_path = target_path
+        
+        self.ANALYSIS_PROMPT = """
+        You are a Senior Python Code Analyst. 
+        Analyze the provided Python code.
+        Output a JSON object with the following fields:
+        1. "summary": One sentence describing the core function.
+        2. "dependencies": List of external libraries used (e.g., numpy, requests).
+        3. "internal_refs": List of potential internal module references.
+        4. "complexity": "High", "Medium", or "Low".
+        5. "is_script": Boolean (true if it has if __name__ == "__main__", else false).
+        """
+
+    def prepare_repo(self, repo_url: str):
+        if self.target_path.exists() and any(self.target_path.iterdir()):
+             # 注意：实际使用时可能需要更灵活的处理，这里保持原样
+             raise FileExistsError(f"目录 {self.target_path} 非空")
+        
+        print(f"[感知] 正在克隆仓库: {repo_url}")
+        subprocess.run(["git", "clone", "--depth=1", repo_url, str(self.target_path)], 
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+    def scan_files(self) -> List[Path]:
+        py_files = []
+        for root, _, files in os.walk(self.target_path):
+            for file in files:
+                if file.endswith(".py"):
+                    py_files.append(Path(root) / file)
+        return py_files
+
+    def analyze_code(self, code_content: str) -> Dict[str, Any]:
+        if not code_content.strip():
+            return {"summary": "Empty file", "complexity": "Low"}
+            
+        response = self.llm.call_ai(
+            system_prompt=self.ANALYSIS_PROMPT,
+            user_prompt=f"Python Code:\n{code_content[:3000]}",
+            json_mode=True
+        )
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            return {"summary": "Analysis failed", "raw": response}
+
+
+# ==========================================
+# 2. 决策层 (DecisionLayer)
+# ==========================================
+class DecisionLayer:
+    def __init__(self, llm: LLMService):
+        self.llm = llm
+        
+        self.STRATEGY_PROMPT = """
+        You are a Software Architect specializing in Python-to-Go migration.
+        Based on the provided Code Analysis, generate a migration strategy.
+        Output a JSON object with:
+        1. "go_libraries": Suggested Go standard or third-party libraries to replace Python deps.
+        2. "risk_assessment": Potential risks (e.g., dynamic typing, reflection usage).
+        3. "todo_list": A ordered list of steps for the developer to implement this in Go.
+        4. "optimization": One suggestion to improve performance or structure in Go.
+        """
+
+    def generate_plan(self, analysis: Dict) -> Dict[str, Any]:
+        user_prompt = f"Code Analysis Data: {json.dumps(analysis)}"
+        
+        response = self.llm.call_ai(
+            system_prompt=self.STRATEGY_PROMPT,
+            user_prompt=user_prompt,
+            json_mode=True
+        )
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            return {
+                "go_libraries": ["standard_library"],
+                "todo_list": ["Direct translation"], 
+                "risk_assessment": "Parse failed"
+            }
+
+
+# ==========================================
+# 3. 执行层 (ExecutionLayer)
+# ==========================================
+class ExecutionLayer:
+    def __init__(self, llm: LLMService, source_root: Path):
+        self.llm = llm
+        self.source_root = source_root.resolve() # 使用绝对路径更安全
+        self.output_root = (source_root / "go_converted").resolve()
+        
+        self.CODER_PROMPT = """
+        You are a Senior Go Developer. 
+        Convert the Python code to idiomatic Go based on the Architect's Strategy.
+        
+        Rules:
+        1. Use the suggested Go libraries from the strategy.
+        2. Follow the Todo List.
+        3. Preserve the exact logic.
+        4. Add comments explaining complex translations.
+        5. OUTPUT ONLY THE GO CODE. No explanation text outside the code block.
+        """
+
+    def copy_assets(self):
+        """
+        资源同步：将非 Python 文件（资源、配置、文档）复制到目标目录，
+        保持原有的目录结构。
+        """
+        print("[执行] 正在同步资源文件 (Assets)...")
+        count = 0
+        for root, dirs, files in os.walk(self.source_root):
+            # 防止递归：跳过 .git 和 输出目录自身
+            # 使用绝对路径字符串进行判断更稳健
+            root_path = Path(root).resolve()
+            if ".git" in str(root_path) or str(self.output_root) in str(root_path):
                 continue
                 
-            # 调用API转换
-            go_code = convert_to_go(client, python_code)
-            
-            # 生成Go文件路径 (保持目录结构)
-            go_file = converted_dir / relative_path.with_suffix('.go')
-            go_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            # 保存Go代码
-            with open(go_file, 'w', encoding='utf-8') as f:
-                f.write(go_code)
-                
-            print(f"  ✅ 转换成功 → {go_file.relative_to(converted_dir)}")
-            success_count += 1
-            
-            # 遵守API速率限制
-            if i < len(py_files):  # 最后一个文件不需要等待
-                time.sleep(1.5)  # 保守的请求间隔
-                
-        except Exception as e:
-            error_msg = f"  ❌ 转换失败: {str(e)}"
-            print(error_msg)
-            failure_details.append(f"{relative_path}: {str(e)}")
-            continue
-    
-    # 生成转换报告
-    print("\n" + "="*50)
-    print(f"转换完成! 成功: {success_count}/{len(py_files)} 个文件")
-    print(f"转换后的Go代码保存在: {converted_dir}")
-    
-    if failure_details:
-        print("\n失败文件详情:")
-        for detail in failure_details:
-            print(f"- {detail}")
+            for file in files:
+                # 只有非py文件才会被复制
+                if not file.endswith(".py"):
+                    src_file = root_path / file
+                    try:
+                        # 计算相对路径
+                        rel_path = src_file.relative_to(self.source_root)
+                        dest_file = self.output_root / rel_path
+                        
+                        dest_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_file, dest_file)
+                        print(f"    -> 复制资源: {rel_path}") # [DEBUG] 打印复制的文件
+                        count += 1
+                    except Exception as e:
+                        print(f"    [警告] 资源 {file} 复制失败: {e}")
+
+        print(f"[执行] 资源同步完成。共复制 {count} 个文件。")
+
+    def execute_conversion(self, code_content: str, analysis: Dict, plan: Dict) -> str:
+        context_info = (
+            f"--- Analysis ---\nSummary: {analysis.get('summary')}\n"
+            f"--- Architect's Plan ---\n"
+            f"Libs: {', '.join(plan.get('go_libraries', []))}\n"
+            f"Todos: {plan.get('todo_list', [])}\n"
+        )
         
-        report_path = converted_dir / "conversion_report.txt"
-        with open(report_path, 'w', encoding='utf-8') as f:
-            f.write(f"转换报告 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"成功: {success_count}/{len(py_files)}\n")
-            f.write("失败文件:\n")
-            for detail in failure_details:
-                f.write(f"- {detail}\n")
-        print(f"\n完整报告已保存至: {report_path}")
+        user_input = f"{context_info}\n\n--- Python Code ---\n{code_content}"
+        
+        return self.llm.call_ai(
+            system_prompt=self.CODER_PROMPT,
+            user_prompt=user_input,
+            temperature=0.2 
+        )
+
+    def save_go_code(self, original_file: Path, go_code: str):
+        rel_path = original_file.resolve().relative_to(self.source_root)
+        dest_file = self.output_root / rel_path.with_suffix('.go')
+        
+        dest_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(dest_file, "w", encoding="utf-8") as f:
+            f.write(go_code)
+        return dest_file
+
+
+# ==========================================
+# 5. 主控层 (Orchestrator)
+# ==========================================
+class Orchestrator:
+    def __init__(self, github_url: str, local_path: str, api_key: str):
+        self.root_path = Path(local_path)
+        
+        # 初始化基础服务
+        self.llm = LLMService(api_key, "https://api.xiaomimimo.com/v1")
+        
+        # 初始化各层 Agent
+        self.memory = MemoryLayer()
+        self.perception = PerceptionLayer(self.llm, self.root_path)
+        self.decision = DecisionLayer(self.llm)
+        self.execution = ExecutionLayer(self.llm, self.root_path)
+        
+        self.repo_url = github_url
+
+    def run(self):
+        print("🚀 多Agent智能重构系统启动...")
+        
+        # 1. 环境准备
+        try:
+            self.perception.prepare_repo(self.repo_url)
+        except Exception as e:
+            print(f"❌ 初始化失败: {e}")
+            return
+
+        # 2. 扫描文件
+        py_files = self.perception.scan_files()
+        total = len(py_files)
+        print(f"📂 发现 {total} 个 Python 文件，准备处理...")
+        
+        # 3. 循环处理
+        for i, py_file in enumerate(py_files, 1):
+            rel_name = py_file.relative_to(self.root_path)
+            print(f"\n[{i}/{total}] 正在处理: {rel_name}")
+            
+            try:
+                # 读取代码
+                with open(py_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+
+                # --- Stage 1: 感知 (Perception) ---
+                print("  👁️  [感知] 分析代码意图...")
+                analysis = self.perception.analyze_code(content)
+                
+                # [新增] 打印感知层完整输出
+                print(f"    ------------ 感知层输出 (JSON) ------------")
+                print(json.dumps(analysis, indent=2, ensure_ascii=False))
+                print(f"    ------------------------------------------")
+
+                # --- Stage 2: 决策 (Decision) ---
+                print("  🧠 [决策] 生成迁移策略...")
+                plan = self.decision.generate_plan(analysis)
+                
+                # [新增] 打印决策层完整输出
+                print(f"    ------------ 决策层输出 (JSON) ------------")
+                print(json.dumps(plan, indent=2, ensure_ascii=False))
+                print(f"    ------------------------------------------")
+
+                # --- Stage 3: 执行 (Execution) ---
+                print("  🔨 [执行] 编写 Go 代码...")
+                go_code = self.execution.execute_conversion(content, analysis, plan)
+                
+                saved_path = self.execution.save_go_code(py_file, go_code)
+                print(f"      -> 已保存: {saved_path.name}")
+
+                # --- Stage 4: 记忆 (Memory) ---
+                self.memory.save_context(str(rel_name), analysis, plan)
+                
+                time.sleep(1)
+
+            except Exception as e:
+                print(f"  ❌ 处理失败: {str(e)}")
+
+        # 4. 资源处理
+        print("\n📦 处理静态资源 (保持原有目录结构)...")
+        # 这里的 copy_assets 会把非py文件全部复制过去，确保资源路径一致
+        self.execution.copy_assets()
+        
+        # 5. 生成报告
+        print("\n✅ 任务完成！")
+        summary = self.memory.get_summary()
+        report_path = self.root_path / "go_converted" / "migration_report.json"
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        print(f"详细报告已生成: {report_path}")
+
+def main():
+    parser = argparse.ArgumentParser(description='多Agent架构 Python 转 Go 工具')
+    parser.add_argument('github_url', help='GitHub仓库URL')
+    parser.add_argument('target_path', help='本地存储路径')
+    parser.add_argument('--api_key', default=os.environ.get("MIMO_API_KEY"), help='API Key')
+    
+    args = parser.parse_args()
+    
+    if not args.api_key:
+        print("请设置环境变量 MIMO_API_KEY 或使用参数 --api_key")
+        sys.exit(1)
+
+    orchestrator = Orchestrator(args.github_url, args.target_path, args.api_key)
+    orchestrator.run()
 
 if __name__ == "__main__":
     main()

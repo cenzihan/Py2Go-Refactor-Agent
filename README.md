@@ -99,7 +99,7 @@ $env:MIMO_API_KEY="sk-xxxxxxxxxxxxxxxx"
 ### 基本用法
 
 ```bash
-python converter.py <GitHub仓库URL> <本地保存路径>
+python converter.py <GitHub仓库URL> <本地保存路径> [--api_key <你的API密钥>]
 
 ```
 
@@ -108,7 +108,7 @@ python converter.py <GitHub仓库URL> <本地保存路径>
 将一个 Flask 项目迁移到 Go：
 
 ```bash
-python converter.py https://github.com/pallets/flask-example.git ./my_flask_go_project
+python converter.py https://github.com/pallets/flask-example.git ./my_flask_go_project --api_key sk-xxxxxxxxxxxxxxxx
 
 ```
 
@@ -118,9 +118,26 @@ python converter.py https://github.com/pallets/flask-example.git ./my_flask_go_p
 | --- | --- | --- |
 | `github_url` | 目标 Python 项目的 GitHub 地址 | ✅ 是 |
 | `target_path` | 代码下载及转换结果的本地保存路径（需为空） | ✅ 是 |
-| `--api_key` | 如果未设置环境变量，可在此传入 Key | ❌ 否 |
+| `--api_key` | MiMo API 密钥，也可以通过环境变量 MIMO_API_KEY 设置 | ❌ 否 |
+
+### 环境变量方式（推荐）
+
+你也可以将 API Key 设置为环境变量，这样就不需要每次都传递 `--api_key` 参数：
+
+```bash
+# Linux/macOS
+export MIMO_API_KEY="sk-xxxxxxxxxxxxxxxx"
+
+# Windows (PowerShell)
+$env:MIMO_API_KEY="sk-xxxxxxxxxxxxxxxx"
+
+# 设置完成后，可以直接运行命令而无需指定 --api_key
+python converter.py https://github.com/pallets/flask-example.git ./my_flask_go_project
+
+```
 
 ---
+
 
 ## 📂 输出结构
 
